@@ -41,21 +41,35 @@ class SmartAudioTrimmer:
         segments = result["segments"]
         return segments
 
-    def get_cut_time_from_transcript(self, segments: List[dict]) -> float:
+    def get_speech_duration(self, segments: List[dict], end_time: float) -> float:
         """
-        Based on transcript segments, find cut_time so trimmed audio <= max_duration.
-        Strategy:
-        - Find segment where cumulative duration > max_duration
-        - Cut at end of this segment or closest segment end before max_duration
+        Calculate total speech duration up to end_time
+        """
+        total_speech = 0.0
+        for seg in segments:
+            seg_start = seg["start"]
+            seg_end = min(seg["end"], end_time)
+            if seg_start < end_time:
+                total_speech += (seg_end - seg_start)
+        return total_speech
+
+    def find_cut_time_for_speech_duration(self, segments: List[dict], 
+                                          target_speech_duration: float) -> float:
+        """
+        Find the cut time needed to get approximately target_speech_duration of actual speech
         """
         if not segments:
             return self.max_duration
-
+        
+        cumulative_speech = 0.0
         for seg in segments:
-            if seg["end"] >= self.max_duration:
+            seg_duration = seg["end"] - seg["start"]
+            if cumulative_speech + seg_duration >= target_speech_duration:
+                # Cut at the end of this segment
                 return seg["end"]
-
-        # If none exceed max_duration, cut at last segment end or max_duration
+            cumulative_speech += seg_duration
+        
+        # If we haven't reached target, return last segment end
         return segments[-1]["end"] if segments else self.max_duration
 
     def trim_audio(self, audio_path: Path, cut_time: float) -> Path:
@@ -75,30 +89,55 @@ class SmartAudioTrimmer:
     def process_pair(self, original_file: Path, diarized_file: Path):
         """
         Process a pair of original and diarized files,
-        trimming both to the same duration based on diarized transcription.
+        trimming both to have approximately the same amount of actual speech.
         """
         print(f"Processing pair:\n  Original: {original_file.name}\n  Diarized: {diarized_file.name}")
-        # Transcribe diarized file to get segments for better speech boundaries
+        
+        # Transcribe both files
+        print("Transcribing diarized file...")
         diarized_segments = self.transcribe(diarized_file)
-        cut_time = self.get_cut_time_from_transcript(diarized_segments)
-
-        # Enforce minimum and maximum duration limits
-        if cut_time < self.min_duration:
-            print(f"Cut time {cut_time:.2f}s less than min_duration {self.min_duration}s, adjusting.")
-            cut_time = self.min_duration
-        if cut_time > self.max_duration:
-            print(f"Cut time {cut_time:.2f}s greater than max_duration {self.max_duration}s, adjusting.")
-            cut_time = self.max_duration
-
-        # Trim both files identically
-        trimmed_original = self.trim_audio(original_file, cut_time)
-        trimmed_diarized = self.trim_audio(diarized_file, cut_time)
+        print("Transcribing original file...")
+        original_segments = self.transcribe(original_file)
+        
+        # Calculate target speech duration based on diarized file
+        # (assuming diarized has cleaner speech)
+        diarized_speech_duration = sum(seg["end"] - seg["start"] for seg in diarized_segments)
+        target_speech_duration = min(diarized_speech_duration, self.max_duration)
+        target_speech_duration = max(target_speech_duration, self.min_duration)
+        
+        print(f"Target speech duration: {target_speech_duration:.2f} seconds")
+        
+        # Find cut times for each file to get similar speech duration
+        diarized_cut_time = self.find_cut_time_for_speech_duration(diarized_segments, target_speech_duration)
+        original_cut_time = self.find_cut_time_for_speech_duration(original_segments, target_speech_duration)
+        
+        # Enforce maximum duration limits
+        diarized_cut_time = min(diarized_cut_time, self.max_duration)
+        original_cut_time = min(original_cut_time, self.max_duration)
+        
+        print(f"Diarized cut time: {diarized_cut_time:.2f}s")
+        print(f"Original cut time: {original_cut_time:.2f}s")
+        
+        # Calculate actual speech in trimmed versions
+        diarized_actual_speech = self.get_speech_duration(diarized_segments, diarized_cut_time)
+        original_actual_speech = self.get_speech_duration(original_segments, original_cut_time)
+        
+        print(f"Diarized speech duration: {diarized_actual_speech:.2f}s")
+        print(f"Original speech duration: {original_actual_speech:.2f}s")
+        
+        # Trim both files with their respective cut times
+        trimmed_original = self.trim_audio(original_file, original_cut_time)
+        trimmed_diarized = self.trim_audio(diarized_file, diarized_cut_time)
 
         # Save logs
         log_data = {
             "original_file": str(original_file),
             "diarized_file": str(diarized_file),
-            "cut_time": cut_time,
+            "original_cut_time": original_cut_time,
+            "diarized_cut_time": diarized_cut_time,
+            "original_speech_duration": original_actual_speech,
+            "diarized_speech_duration": diarized_actual_speech,
+            "target_speech_duration": target_speech_duration,
             "trimmed_original": str(trimmed_original),
             "trimmed_diarized": str(trimmed_diarized),
         }
@@ -106,6 +145,7 @@ class SmartAudioTrimmer:
         with open(log_path, "w") as f:
             json.dump(log_data, f, indent=2)
         print(f"Saved log to {log_path}")
+        print("-" * 50)
 
     def process_folder(self):
         files = list(self.input_folder.glob("*.*"))
@@ -126,8 +166,11 @@ class SmartAudioTrimmer:
                 else:
                     # Без пары - обрезаем только оригинал
                     segments = self.transcribe(file)
-                    cut_time = self.get_cut_time_from_transcript(segments)
-                    cut_time = max(self.min_duration, min(cut_time, self.max_duration))
+                    speech_duration = sum(seg["end"] - seg["start"] for seg in segments)
+                    target_speech = min(speech_duration, self.max_duration)
+                    target_speech = max(target_speech, self.min_duration)
+                    cut_time = self.find_cut_time_for_speech_duration(segments, target_speech)
+                    cut_time = min(cut_time, self.max_duration)
                     self.trim_audio(file, cut_time)
                     processed_stems.add(fname)
 
@@ -138,16 +181,19 @@ class SmartAudioTrimmer:
                 if not original_path.exists() and fname not in processed_stems:
                     # Без пары - обрезаем только диаризованный файл
                     segments = self.transcribe(file)
-                    cut_time = self.get_cut_time_from_transcript(segments)
-                    cut_time = max(self.min_duration, min(cut_time, self.max_duration))
+                    speech_duration = sum(seg["end"] - seg["start"] for seg in segments)
+                    target_speech = min(speech_duration, self.max_duration)
+                    target_speech = max(target_speech, self.min_duration)
+                    cut_time = self.find_cut_time_for_speech_duration(segments, target_speech)
+                    cut_time = min(cut_time, self.max_duration)
                     self.trim_audio(file, cut_time)
                     processed_stems.add(fname)
 
 
 
 def main():
-    INPUT_FOLDER = "input_audio"
-    OUTPUT_FOLDER = "output_audio"
+    INPUT_FOLDER = "/Users/margotiamanova/Desktop/PROJECTS/smart_audio_trim/input_audio_test"
+    OUTPUT_FOLDER = "/Users/margotiamanova/Desktop/PROJECTS/smart_audio_trim/output_audio_test"
     MIN_DURATION = 60  # 1 minute
     MAX_DURATION = 120 # 2 minutes
     MODEL_SIZE = "base"
